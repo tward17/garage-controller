@@ -5,6 +5,8 @@ import dht
 import asyncio
 import secrets
 import config
+import sys
+import onewire, ds18x20
 from umqtt.simple import MQTTClient
 
 # WiFi connection details
@@ -15,6 +17,12 @@ PASSWORD = secrets.WIFI_PASSWORD
 MQTT_BROKER = config.MQTT_BROKER_ADDRESS 
 MQTT_PORT = config.MQTT_BROKER_PORT
 MQTT_CLIENT_ID = 'garage_controller'
+
+# FEATURES ENABLED
+MONITOR_MOTION = config.MOTION_SENSOR_ENABLED
+MONITOR_ENVIRONMENT = config.ENVIRONMENT_SENSOR_ENABLED
+MONITOR_DOOR_POSITION = config.GARAGE_DOOR_POSTION_SENSOR_ENABLED
+MONITOR_BUTTON_PRESS = config.BUTTON_ENABLED
 
 # MQTT Sub Topics
 GARAGE_DOOR_ACTIVATE = b'garage/door/activate'
@@ -28,12 +36,13 @@ GARAGE_ENVIRONMENT_HUMIDITY = b'garage/environment/humidity'
 GARAGE_MOTION = b'garage/motion/status'
 
 #GPIO Pin Assignments
-DOOR_BUTTON = 28
+DOOR_BUTTON = 6
 DOOR_RELAY = 18
 LIGHT_RELAY = 19
 DOOR_SENSOR = 10
 ENVIRONMENT_SENSOR = 2
-PIR_SENSOR = 6
+PIR_SENSOR = 27
+DS_SENSOR = 28
 
 # Setup the button GPIO pin as input with an internal pull-up resistor
 button = machine.Pin(DOOR_BUTTON, machine.Pin.IN, machine.Pin.PULL_UP)
@@ -45,6 +54,7 @@ relay = machine.Pin(LIGHT_RELAY, machine.Pin.OUT)
 relay.value(0)  # Set relay initially OFF (0)
 
 pir = machine.Pin(PIR_SENSOR, machine.Pin.IN)
+ds_sensor = ds18x20.DS18X20(onewire.OneWire(machine.Pin(DS_SENSOR)))
 
 class Environment:
     def __init__(self, mqtt_client):
@@ -114,8 +124,15 @@ def connect_wifi():
     if not wlan.isconnected():
         print('Connecting to WiFi...')
         wlan.connect(SSID, PASSWORD)
+        i = 0
         while not wlan.isconnected():
             time.sleep(1)
+            i += 1
+            
+            if i > 30:
+                print('Could not connect to Wifi.')
+                sys.exit()
+
         print('WiFi connected')
         print('IP address:', wlan.ifconfig()[0])
 
@@ -155,14 +172,24 @@ def relay_action(relay, action):
     elif action == b'TOGGLE':
         print('Toggle relay')
         relay.toggle()
+    elif action == b'PRESS':
+        print('Relay Press')
+        relay.value(1)
+        time.sleep(0.2)
+        relay.value(0)
     else:
         print('Unknown command for relay:', action)
 
 
 # Main logic to run the MQTT client
 async def main():
+
     # Connect to Wi-Fi
-    connect_wifi()
+    if secrets.SSID != '' and secrets.WIFI_PASSWORD != '':
+        connect_wifi()
+    else:
+        print('No Wifi details in secrets file. Exiting.')
+        sys.exit()
 
     # Connect to MQTT broker
     client = connect_mqtt()
@@ -170,37 +197,53 @@ async def main():
     # Subscribe to necessary topics
     print('Subscribing to topics:')
     client.subscribe(GARAGE_DOOR_ACTIVATE)
+    print(GARAGE_DOOR_ACTIVATE)
     client.subscribe(GARAGE_LIGHT_ACTIVATE)
+    print(GARAGE_LIGHT_ACTIVATE)
 
-    # Publish an initial message to the MQTT topic
-    #publish_message(client, MQTT_TOPIC_PUB, b'Hello from MicroPython!')
+    #if MONITOR_ENVIRONMENT:
+    #    # Initialise Environment object
+    #    enviro = Environment(client)
+    #    asyncio.create_task(enviro.monitor_status())
 
-    # Initialise Environment object
-    enviro = Environment(client)
-    asyncio.create_task(enviro.monitor_status())
+    if MONITOR_DOOR_POSITION:
+        # Initialise Door object
+        door = Door(client)
+        asyncio.create_task(door.monitor_status())
 
-    # Initialise Door object
-    door = Door(client)
-    asyncio.create_task(door.monitor_status())
+    roms = ds_sensor.scan()
+    print('Found DS devices: ', roms)
 
     try:
         while True:
             # Check for any incoming MQTT messages
             client.check_msg()
 
-            # Check if the button is pressed (LOW signal on the GPIO pin)
-            if button.value() == 0:  # Button is pressed (active low)
-                print('Button pressed!')
-                # Debounce the button press (wait for release)
-                while button.value() == 0:
-                    time.sleep(0.1)
+            if MONITOR_BUTTON_PRESS:
+                # Check if the button is pressed (LOW signal on the GPIO pin)
+                if button.value() == 0:  # Button is pressed (active low)
+                    print('Button pressed!')
+                    # Debounce the button press (wait for release)
+                    while button.value() == 0:
+                        time.sleep(0.1)
+                    relay_action(DOOR_RELAY,b'PRESS')
             
-            if pir.value(1):
-                print('motion detected')
-            else:
-                print('No Motion')
+            if MONITOR_MOTION:
+                if pir.value():
+                    print('motion detected')
+                else:
+                    print('No Motion')
 
-            await asyncio.sleep(0.1)
+            ds_sensor.convert_temp()
+            #time.sleep_ms(1000)
+            await asyncio.sleep(0.75)
+            for rom in roms:
+                print(rom)
+                tempC = ds_sensor.read_temp(rom)
+                print('temperature (ºC):', "{:.2f}".format(tempC))
+
+            #await asyncio.sleep(0.1)
+            await asyncio.sleep(5)
             #time.sleep(0.1)  # Small delay to prevent overloading the loop
 
     except KeyboardInterrupt:
