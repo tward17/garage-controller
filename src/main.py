@@ -18,10 +18,16 @@ MQTT_BROKER = config.MQTT_BROKER_ADDRESS
 MQTT_PORT = config.MQTT_BROKER_PORT
 MQTT_CLIENT_ID = 'garage_controller'
 
+# HEARTBEAT
+HEARTBEAT_MINUTES = config.MONITOR_HEARTBEAT_MINUTES
+
 # FEATURES ENABLED
-MONITOR_MOTION = config.MOTION_SENSOR_ENABLED
-MONITOR_ENVIRONMENT = config.ENVIRONMENT_SENSOR_ENABLED
-MONITOR_DOOR_POSITION = config.GARAGE_DOOR_POSTION_SENSOR_ENABLED
+MONITOR_MOTION = config.MONITOR_MOTION_SENSOR_ENABLED
+MONITOR_MOTION_POLLING_SECONDS = config.MONITOR_MOTION_POLLING_SECONDS
+MONITOR_DHT22 = config.MONITOR_DHT22_ENABLED
+MONITOR_DHT22_POLLING_SECONDS = config.MONITOR_DHT22_POLLING_SECONDS
+MONITOR_DOOR_POSITION = config.MONITOR_GARAGE_DOOR_POSTION_SENSOR_ENABLED
+MONITOR_DOOR_POLLING_SECONDS = config.MONITOR_GARAGE_DOOR_POSITION_POLLING_SECONDS
 MONITOR_BUTTON_PRESS = config.BUTTON_ENABLED
 
 # MQTT Sub Topics
@@ -31,90 +37,184 @@ GARAGE_LIGHT_ACTIVATE = b'garage/light/activate'
 #MQTT Pub Topics
 GARAGE_DOOR_STATUS = b'garage/door/status'
 GARAGE_LIGHT_STATUS = b'garage/light/status'
-GARAGE_ENVIRONMENT_TEMPERATURE = b'garage/environment/temperature'
-GARAGE_ENVIRONMENT_HUMIDITY = b'garage/environment/humidity'
+GARAGE_DHT22_TEMPERATURE = b'garage/environment/temperature'
+GARAGE_DHT22_HUMIDITY = b'garage/environment/humidity'
 GARAGE_MOTION = b'garage/motion/status'
 
 #GPIO Pin Assignments
-DOOR_BUTTON = 6
-DOOR_RELAY = 18
-LIGHT_RELAY = 19
-DOOR_SENSOR = 10
-ENVIRONMENT_SENSOR = 2
-PIR_SENSOR = 27
-DS_SENSOR = 28
+DOOR_RELAY_PIN = 18
+LIGHT_RELAY_PIN = 19
 
-# Setup the button GPIO pin as input with an internal pull-up resistor
-button = machine.Pin(DOOR_BUTTON, machine.Pin.IN, machine.Pin.PULL_UP)
+BUTTON_SENSOR_PIN = 17
+DOOR_SENSOR_PIN = 6
+DHT22_SENSOR_PIN = 27
+PIR_SENSOR_PIN = 28
 
-# Setup the relay GPIO pin as output (relay ON when pin is HIGH, OFF when pin is LOW)
-relay = machine.Pin(DOOR_RELAY, machine.Pin.OUT)
-relay.value(0)  # Set relay initially OFF (0)
-relay = machine.Pin(LIGHT_RELAY, machine.Pin.OUT)
-relay.value(0)  # Set relay initially OFF (0)
+class Relay:
+    def __init__(self, mqtt_client, relayPin):
+        self.client = mqtt_client
+        self.relay = machine.Pin(relayPin, machine.Pin.OUT) # Setup the relay GPIO pin as output (relay ON when pin is HIGH, OFF when pin is LOW)
+        self.relay.value(0) # Set relay initially OFF (0)
+    
+    def action(self, command):
+        if command == b'ON':
+            self.on()
+        elif command == b'OFF':
+            self.off()
+        elif command == b'TOGGLE':
+            self.toggle()
+        elif command == b'PRESS':
+            self.press()
+        else:
+            print('Unknown command for relay:', command)
 
-pir = machine.Pin(PIR_SENSOR, machine.Pin.IN)
-ds_sensor = ds18x20.DS18X20(onewire.OneWire(machine.Pin(DS_SENSOR)))
+    def on(self):
+        print('Turning relay ON')
+        self.relay.value(1)
+    
+    def off(self):
+        print('Turning relay OFF')
+        self.relay.value(0)
 
-class Environment:
+    def toggle(self):
+        print('Toggle relay')
+        self.relay.toggle()
+
+    def press(self):
+        self.relay.value(1)
+        time.sleep(0.2)
+        self.relay.value(0)
+
+class DHT22Monitor:
     def __init__(self, mqtt_client):
         self.client = mqtt_client
-        self.sensor = dht.DHT22(machine.Pin(ENVIRONMENT_SENSOR))
+        self.sensor = dht.DHT22(machine.Pin(DHT22_SENSOR_PIN))
         self.temperature = int(0)
         self.humidity = int(0)
+        self.pollsSinceLastTemperaturePublishCount = 0
+        self.pollsSinceLastHumidityPublishCount = 0
+        self.heartBeatLimit = (HEARTBEAT_MINUTES * 60) / MONITOR_DHT22_POLLING_SECONDS
 
     async def monitor_status(self):
         while True:
             try:
-                print('Checking Environment')
+                #print('Checking DHT22')
                 self.sensor.measure()
-                current_temperature = round(self.sensor.temperature())
-                current_humidity = round(self.sensor.humidity())
+                currentTemperature = round(self.sensor.temperature(),1)
+                currentHumidity = round(self.sensor.humidity(),1)
 
-                if self.temperature != current_temperature:
-                    self.update_temperature(current_temperature)
-                if self.humidity != current_humidity:
-                    self.update_humidity(current_humidity)
+                self.pollsSinceLastTemperaturePublishCount += 1
+                self.pollsSinceLastHumidityPublishCount +=1
 
-                del current_temperature, current_humidity
+                if self.temperature != currentTemperature or self.pollsSinceLastTemperaturePublishCount >= self.heartBeatLimit:
+                    self.update_temperature(currentTemperature)
 
-                await asyncio.sleep(5)
+                if self.humidity != currentHumidity or self.pollsSinceLastHumidityPublishCount >= self.heartBeatLimit:
+                    self.update_humidity(currentHumidity)
+
+                del currentTemperature, currentHumidity
+
+                await asyncio.sleep(MONITOR_DHT22_POLLING_SECONDS)
 
             except OSError as e:
-                print('Failed to read sensor.')
+                print('Failed to read DHT22 sensor.')
 
     def update_temperature(self, temperature):
         self.temperature = temperature
-        print('Temperature change to: ' + str(self.temperature))
-        publish_message(self.client,GARAGE_ENVIRONMENT_TEMPERATURE, str(self.temperature))
+        print('DHT22 Temperature change to: ' + str(self.temperature))
+        publish_message(self.client,GARAGE_DHT22_TEMPERATURE, str(self.temperature))
+        self.pollsSinceLastTemperaturePublishCount = 0
 
     def update_humidity(self, humidity):
         self.humidity = humidity
-        print('Humidity change to: ' + str(self.humidity))
-        publish_message(self.client,GARAGE_ENVIRONMENT_HUMIDITY,str(self.humidity))
+        print('DHT22 Humidity change to: ' + str(self.humidity))
+        publish_message(self.client, GARAGE_DHT22_HUMIDITY, str(self.humidity))
+        self.pollsSinceLastHumidityPublishCount = 0
 
-class Door:
+class PIRMonitor:
     def __init__(self, mqtt_client):
         self.client = mqtt_client
-        self.state = ''
-        self.sensor = machine.Pin(DOOR_SENSOR, machine.Pin.IN, machine.Pin.PULL_UP)
+        self.sensor = machine.Pin(PIR_SENSOR_PIN, machine.Pin.IN)
+        self.motion = 'NO MOTION'
+        self.pollsSinceLastMotionPublishCount = 0
+        self.heartBeatLimit = (HEARTBEAT_MINUTES * 60) / MONITOR_MOTION_POLLING_SECONDS
 
     async def monitor_status(self):
         while True:
-            print('Checking Garage Door state')
-            current_state = 'OPEN' if self.sensor.value() == 1 else 'CLOSED'
+            try:
+                #print('Checking Motion')
+                currentMotion = 'MOTION DETECTED' if self.sensor.value() else 'NO MOTION'
 
-            if self.state != current_state:
-                self.update_state(current_state)
+                self.pollsSinceLastMotionPublishCount += 1
 
-            del current_state
+                if self.motion != currentMotion or self.pollsSinceLastMotionPublishCount >= self.heartBeatLimit:
+                   self.update_motion(currentMotion)
 
-            await asyncio.sleep(2)
+                del currentMotion
 
-    def update_state(self, state):
-        self.state = state
-        print('Door state changed to: ' + self.state)
-        publish_message(self.client, GARAGE_DOOR_STATUS, self.state)
+                await asyncio.sleep(MONITOR_MOTION_POLLING_SECONDS)
+
+            except:
+                print('Failed to read PIR sensor.')
+
+    def update_motion(self, motion):
+        self.motion = motion
+        print('Motion changed to: ' + self.motion)
+        publish_message(self.client, GARAGE_MOTION, str(self.motion))
+        self.pollsSinceLastMotionPublishCount = 0
+
+class DoorPositionMonitor:
+    def __init__(self, mqtt_client):
+        self.client = mqtt_client
+        self.sensor = machine.Pin(DOOR_SENSOR_PIN, machine.Pin.IN, machine.Pin.PULL_UP)
+        self.position = 'CLOSED'
+        self.pollsSinceLastPositionPublishCount = 0
+        self.heartBeatLimit = (HEARTBEAT_MINUTES * 60) / MONITOR_DOOR_POLLING_SECONDS
+
+    async def monitor_status(self):
+        while True:
+            try:
+                #print('Checking Door Position')
+                currentPosition = 'OPEN' if self.sensor.value() == 1 else 'CLOSED'
+
+                self.pollsSinceLastPositionPublishCount += 1
+
+                if self.position != currentPosition or self.pollsSinceLastPositionPublishCount >= self.heartBeatLimit:
+                   self.update_position(currentPosition)
+
+                del currentPosition
+
+                await asyncio.sleep(MONITOR_DOOR_POLLING_SECONDS)
+
+            except:
+                print('Failed to read Door Position sensor.')
+
+    def update_position(self, position):
+        self.position = position
+        print('Position changed to: ' + self.position)
+        publish_message(self.client, GARAGE_DOOR_STATUS, str(self.position))
+        self.pollsSinceLastPositionPublishCount = 0
+
+class ButtonPressMonitor:
+    def __init__(self):
+        self.sensor = machine.Pin(BUTTON_SENSOR_PIN, machine.Pin.IN, machine.Pin.PULL_UP)
+        self.pressed = False
+
+    async def monitor_status(self):
+        while True:
+            try:
+                # Check if the button is pressed (LOW signal on the GPIO pin)
+                if self.sensor.value() == 0:  # Button is pressed (active low)
+                    print('Button pressed!')
+                    # Debounce the button press (wait for release)
+                    while self.sensor.value() == 0:
+                        await asyncio.sleep(0.1)
+                    relay_action(DOOR_RELAY_PIN,b'PRESS')
+
+                await asyncio.sleep(0.1)
+
+            except:
+                print('Failed to read button sensor.')
 
 # Connect to Wi-Fi
 def connect_wifi():
@@ -128,8 +228,8 @@ def connect_wifi():
         while not wlan.isconnected():
             time.sleep(1)
             i += 1
-            
-            if i > 30:
+            print('connection wait: ' + str(i))
+            if i > 10:
                 print('Could not connect to Wifi.')
                 sys.exit()
 
@@ -141,10 +241,10 @@ def mqtt_callback(topic, msg):
     print('Received message on topic:', topic.decode())
     print('Message:', msg.decode())
     
-    if topic == GARAGE_DOOR_ACTIVATE:
-        relay_action(DOOR_RELAY, msg)
-    elif topic == GARAGE_LIGHT_ACTIVATE:
-        relay_action(LIGHT_RELAY, msg)
+    #if topic == GARAGE_DOOR_ACTIVATE:
+        #relay_action(DOOR_RELAY_PIN, msg)
+    #elif topic == GARAGE_LIGHT_ACTIVATE:
+        #relay_action(LIGHT_RELAY_PIN, msg)
             
 # Connect to MQTT Broker
 def connect_mqtt():
@@ -158,28 +258,6 @@ def connect_mqtt():
 def publish_message(client, topic, message):
     print('Publishing message to topic:', topic.decode())
     client.publish(topic, message)
-
-# Action Relay
-def relay_action(relay, action):
-    relay = machine.Pin(relay, machine.Pin.OUT)
-    
-    if action == b'ON':
-        print('Turning relay ON')
-        relay.value(1)  # Turn relay ON
-    elif action == b'OFF':
-        print('Turning relay OFF')
-        relay.value(0)  # Turn relay OFF
-    elif action == b'TOGGLE':
-        print('Toggle relay')
-        relay.toggle()
-    elif action == b'PRESS':
-        print('Relay Press')
-        relay.value(1)
-        time.sleep(0.2)
-        relay.value(0)
-    else:
-        print('Unknown command for relay:', action)
-
 
 # Main logic to run the MQTT client
 async def main():
@@ -201,50 +279,36 @@ async def main():
     client.subscribe(GARAGE_LIGHT_ACTIVATE)
     print(GARAGE_LIGHT_ACTIVATE)
 
-    #if MONITOR_ENVIRONMENT:
-    #    # Initialise Environment object
-    #    enviro = Environment(client)
-    #    asyncio.create_task(enviro.monitor_status())
+    # Initialise relays
+    doorRelay = Relay(client, DOOR_RELAY_PIN)
+    lightRelay = Relay(client, LIGHT_RELAY_PIN)
+
+    if MONITOR_DHT22:
+        # Initialise DHT22Monitor object
+        enviro = DHT22Monitor(client)
+        asyncio.create_task(enviro.monitor_status())
+
+    if MONITOR_MOTION:
+        # Initialise PIRMonitor object
+        motion = PIRMonitor(client)
+        asyncio.create_task(motion.monitor_status())
 
     if MONITOR_DOOR_POSITION:
-        # Initialise Door object
-        door = Door(client)
+        # Initialise DoorPisitionMonitor object
+        door = DoorPositionMonitor(client)
         asyncio.create_task(door.monitor_status())
 
-    roms = ds_sensor.scan()
-    print('Found DS devices: ', roms)
-
+    if MONITOR_BUTTON_PRESS:
+        # Initialise ButtonPressMonitor object
+        button = ButtonPressMonitor()
+        asyncio.create_task(button.monitor_status())
     try:
         while True:
             # Check for any incoming MQTT messages
             client.check_msg()
-
-            if MONITOR_BUTTON_PRESS:
-                # Check if the button is pressed (LOW signal on the GPIO pin)
-                if button.value() == 0:  # Button is pressed (active low)
-                    print('Button pressed!')
-                    # Debounce the button press (wait for release)
-                    while button.value() == 0:
-                        time.sleep(0.1)
-                    relay_action(DOOR_RELAY,b'PRESS')
             
-            if MONITOR_MOTION:
-                if pir.value():
-                    print('motion detected')
-                else:
-                    print('No Motion')
-
-            ds_sensor.convert_temp()
-            #time.sleep_ms(1000)
-            await asyncio.sleep(0.75)
-            for rom in roms:
-                print(rom)
-                tempC = ds_sensor.read_temp(rom)
-                print('temperature (ºC):', "{:.2f}".format(tempC))
-
-            #await asyncio.sleep(0.1)
-            await asyncio.sleep(5)
-            #time.sleep(0.1)  # Small delay to prevent overloading the loop
+            # Small delay to prevent overloading the loop
+            await asyncio.sleep(0.1)
 
     except KeyboardInterrupt:
         print('Disconnecting...')
