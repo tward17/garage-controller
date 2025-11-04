@@ -6,7 +6,6 @@ import asyncio
 import secrets
 import config
 import sys
-import onewire, ds18x20
 from umqtt.simple import MQTTClient
 
 # WiFi connection details
@@ -31,15 +30,15 @@ MONITOR_DOOR_POLLING_SECONDS = config.MONITOR_GARAGE_DOOR_POSITION_POLLING_SECON
 MONITOR_BUTTON_PRESS = config.BUTTON_ENABLED
 
 # MQTT Sub Topics
-GARAGE_DOOR_ACTIVATE = b'garage/door/activate'
-GARAGE_LIGHT_ACTIVATE = b'garage/light/activate'
+GARAGE_DOOR_ACTIVATE = 'garage/door/activate'
+GARAGE_LIGHT_ACTIVATE = 'garage/light/activate'
 
 #MQTT Pub Topics
-GARAGE_DOOR_STATUS = b'garage/door/status'
-GARAGE_LIGHT_STATUS = b'garage/light/status'
-GARAGE_DHT22_TEMPERATURE = b'garage/environment/temperature'
-GARAGE_DHT22_HUMIDITY = b'garage/environment/humidity'
-GARAGE_MOTION = b'garage/motion/status'
+GARAGE_DOOR_STATUS = 'garage/door/status'
+GARAGE_LIGHT_STATUS = 'garage/light/status'
+GARAGE_DHT22_TEMPERATURE = 'garage/environment/temperature'
+GARAGE_DHT22_HUMIDITY = 'garage/environment/humidity'
+GARAGE_MOTION = 'garage/motion/status'
 
 #GPIO Pin Assignments
 DOOR_RELAY_PIN = 18
@@ -50,37 +49,62 @@ DOOR_SENSOR_PIN = 6
 DHT22_SENSOR_PIN = 27
 PIR_SENSOR_PIN = 28
 
-class Relay:
-    def __init__(self, mqtt_client, relayPin):
+class Observer():
+    _observers = []
+    def __init__(self):
+        self._observers.append(self)
+        self._observables = {}
+    def observe(self, event_name, callback):
+        self._observables[event_name] = callback
+
+class Event():
+    def __init__(self, name, data, autofire = True):
+        self.name = name
+        self.data = data
+        if autofire:
+            self.fire()
+    def fire(self):
+        for observer in Observer._observers:
+            if self.name in observer._observables:
+                observer._observables[self.name](self.data)
+
+class Relay(Observer):
+    def __init__(self, mqtt_client, topic, relayPin, allowedActions = ['ON','OFF','TOGGLE']):
+        Observer.__init__(self)
         self.client = mqtt_client
+        self.topic = topic
+        self.allowedActions = allowedActions
         self.relay = machine.Pin(relayPin, machine.Pin.OUT) # Setup the relay GPIO pin as output (relay ON when pin is HIGH, OFF when pin is LOW)
         self.relay.value(0) # Set relay initially OFF (0)
     
     def action(self, command):
-        if command == b'ON':
-            self.on()
-        elif command == b'OFF':
-            self.off()
-        elif command == b'TOGGLE':
-            self.toggle()
-        elif command == b'PRESS':
-            self.press()
+        if command not in self.allowedActions:
+            return
+
+        if command == 'ON':
+            self.__on()
+        elif command == 'OFF':
+            self.__off()
+        elif command == 'TOGGLE':
+            self.__toggle()
+        elif command == 'PRESS':
+            self.__press()
         else:
             print('Unknown command for relay:', command)
 
-    def on(self):
+    def __on(self):
         print('Turning relay ON')
         self.relay.value(1)
     
-    def off(self):
+    def __off(self):
         print('Turning relay OFF')
         self.relay.value(0)
 
-    def toggle(self):
+    def __toggle(self):
         print('Toggle relay')
         self.relay.toggle()
 
-    def press(self):
+    def __press(self):
         self.relay.value(1)
         time.sleep(0.2)
         self.relay.value(0)
@@ -135,7 +159,7 @@ class PIRMonitor:
     def __init__(self, mqtt_client):
         self.client = mqtt_client
         self.sensor = machine.Pin(PIR_SENSOR_PIN, machine.Pin.IN)
-        self.motion = 'NO MOTION'
+        self.motion = ''
         self.pollsSinceLastMotionPublishCount = 0
         self.heartBeatLimit = (HEARTBEAT_MINUTES * 60) / MONITOR_MOTION_POLLING_SECONDS
 
@@ -209,7 +233,8 @@ class ButtonPressMonitor:
                     # Debounce the button press (wait for release)
                     while self.sensor.value() == 0:
                         await asyncio.sleep(0.1)
-                    relay_action(DOOR_RELAY_PIN,b'PRESS')
+                    
+                    Event(GARAGE_DOOR_ACTIVATE, 'PRESS')
 
                 await asyncio.sleep(0.1)
 
@@ -241,10 +266,7 @@ def mqtt_callback(topic, msg):
     print('Received message on topic:', topic.decode())
     print('Message:', msg.decode())
     
-    #if topic == GARAGE_DOOR_ACTIVATE:
-        #relay_action(DOOR_RELAY_PIN, msg)
-    #elif topic == GARAGE_LIGHT_ACTIVATE:
-        #relay_action(LIGHT_RELAY_PIN, msg)
+    Event(topic.decode(), msg.decode())
             
 # Connect to MQTT Broker
 def connect_mqtt():
@@ -256,7 +278,7 @@ def connect_mqtt():
 
 # Publish a message to MQTT topic
 def publish_message(client, topic, message):
-    print('Publishing message to topic:', topic.decode())
+    print('Publishing message to topic:', topic)
     client.publish(topic, message)
 
 # Main logic to run the MQTT client
@@ -280,8 +302,10 @@ async def main():
     print(GARAGE_LIGHT_ACTIVATE)
 
     # Initialise relays
-    doorRelay = Relay(client, DOOR_RELAY_PIN)
-    lightRelay = Relay(client, LIGHT_RELAY_PIN)
+    doorRelay = Relay(client, GARAGE_DOOR_ACTIVATE, DOOR_RELAY_PIN, ['PRESS'])
+    doorRelay.observe(GARAGE_DOOR_ACTIVATE, doorRelay.action)
+    lightRelay = Relay(client, GARAGE_LIGHT_ACTIVATE, LIGHT_RELAY_PIN)
+    lightRelay.observe(GARAGE_LIGHT_ACTIVATE, lightRelay.action)
 
     if MONITOR_DHT22:
         # Initialise DHT22Monitor object
